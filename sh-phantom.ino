@@ -1,0 +1,546 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <math.h>
+
+MPU6050 mpu;
+
+// =====================================================
+// PIN CONFIGURATION
+// =====================================================
+
+#define MPU_INT_PIN 23
+#define CANCEL_BUTTON_PIN 5
+
+// =====================================================
+// HELMET STATUS
+// =====================================================
+
+// TEMPORARY:
+// Since pressure sensor is NOT connected yet,
+// keep this true for testing.
+//
+// Later this will come from pressure sensor.
+bool HELMET_WORN = true;
+
+
+// =====================================================
+// CRASH DETECTION THRESHOLDS
+// =====================================================
+
+// Acceleration threshold for detecting a strong impact.
+// Unit: g
+const float IMPACT_THRESHOLD = 3.0;
+
+// Very little acceleration movement.
+// Because gravity is always present, we compare
+// acceleration magnitude against ~1g.
+const float ACCEL_LOW_MIN = 0.85;
+const float ACCEL_LOW_MAX = 1.15;
+
+// Gyroscope threshold for very little rotation.
+// Unit: degrees/sec
+const float GYRO_LOW_THRESHOLD = 15.0;
+
+
+// =====================================================
+// TIMINGS
+// =====================================================
+
+// How long we observe the helmet after an impact
+// to determine whether motion has stopped.
+const unsigned long CONFIRMATION_WINDOW = 1500;
+
+// How long the helmet must remain almost motionless
+// before crash is confirmed.
+const unsigned long NO_MOTION_REQUIRED = 700;
+
+// Cancellation time AFTER crash confirmation.
+const unsigned long CANCEL_TIME = 10000;
+
+
+// =====================================================
+// STATES
+// =====================================================
+
+enum CrashState {
+  NORMAL,
+  IMPACT_DETECTED,
+  CRASH_CONFIRMED,
+  ALERT_SENT
+};
+
+CrashState state = NORMAL;
+
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+unsigned long impactTime = 0;
+unsigned long noMotionStartTime = 0;
+unsigned long crashConfirmedTime = 0;
+
+bool noMotionStarted = false;
+
+
+// =====================================================
+// MPU VALUES
+// =====================================================
+
+int16_t axRaw, ayRaw, azRaw;
+int16_t gxRaw, gyRaw, gzRaw;
+
+float ax, ay, az;
+float gx, gy, gz;
+
+float accelerationMagnitude;
+float gyroMagnitude;
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("====================================");
+  Serial.println("     SMART HELMET CRASH SYSTEM");
+  Serial.println("====================================");
+
+  // MPU interrupt
+  pinMode(MPU_INT_PIN, INPUT);
+
+  // Cancel button
+  pinMode(CANCEL_BUTTON_PIN, INPUT_PULLUP);
+
+  // I2C
+  Wire.begin();
+
+  // MPU initialization
+  mpu.initialize();
+
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 connected successfully.");
+  }
+  else {
+    Serial.println("ERROR: MPU6050 connection failed!");
+    while (1);
+  }
+
+  Serial.println();
+
+  if (HELMET_WORN) {
+    Serial.println("Helmet status: WORN");
+  }
+  else {
+    Serial.println("Helmet status: NOT WORN");
+  }
+
+  Serial.println();
+  Serial.println("System ready.");
+  Serial.println("====================================");
+}
+
+
+// =====================================================
+// READ MPU
+// =====================================================
+
+void readMPU() {
+
+  mpu.getMotion6(
+    &axRaw,
+    &ayRaw,
+    &azRaw,
+    &gxRaw,
+    &gyRaw,
+    &gzRaw
+  );
+
+  // Convert accelerometer values to g
+  ax = axRaw / 16384.0;
+  ay = ayRaw / 16384.0;
+  az = azRaw / 16384.0;
+
+  // Convert gyro to deg/sec
+  gx = gxRaw / 131.0;
+  gy = gyRaw / 131.0;
+  gz = gzRaw / 131.0;
+
+  // Total acceleration
+  accelerationMagnitude =
+    sqrt(
+      ax * ax +
+      ay * ay +
+      az * az
+    );
+
+  // Total rotational movement
+  gyroMagnitude =
+    sqrt(
+      gx * gx +
+      gy * gy +
+      gz * gz
+    );
+}
+
+
+// =====================================================
+// CHECK HIGH IMPACT
+// =====================================================
+
+bool highImpactDetected() {
+
+  if (accelerationMagnitude >= IMPACT_THRESHOLD) {
+    return true;
+  }
+
+  return false;
+}
+
+
+// =====================================================
+// CHECK VERY LITTLE MOTION
+// =====================================================
+
+bool veryLittleMotionDetected() {
+
+  bool accelerationStable =
+    (accelerationMagnitude >= ACCEL_LOW_MIN &&
+     accelerationMagnitude <= ACCEL_LOW_MAX);
+
+  bool rotationStable =
+    (gyroMagnitude <= GYRO_LOW_THRESHOLD);
+
+  return (accelerationStable && rotationStable);
+}
+
+
+// =====================================================
+// NORMAL STATE
+// =====================================================
+
+void handleNormalState() {
+
+  // ---------------------------------------------------
+  // Helmet must be worn
+  // ---------------------------------------------------
+
+  if (!HELMET_WORN) {
+
+    Serial.println("Helmet NOT worn -> crash detection ignored.");
+
+    delay(200);
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // Check for high impact
+  // ---------------------------------------------------
+
+  if (highImpactDetected()) {
+
+    Serial.println();
+    Serial.println("!!! HIGH IMPACT DETECTED !!!");
+
+    Serial.print("Acceleration: ");
+    Serial.print(accelerationMagnitude);
+    Serial.println(" g");
+
+    Serial.println("Entering impact confirmation phase...");
+
+    impactTime = millis();
+
+    noMotionStarted = false;
+
+    state = IMPACT_DETECTED;
+  }
+}
+
+
+// =====================================================
+// IMPACT CONFIRMATION
+// =====================================================
+
+void handleImpactDetected() {
+
+  unsigned long elapsedTime =
+    millis() - impactTime;
+
+
+  // ---------------------------------------------------
+  // Check whether motion has stopped
+  // ---------------------------------------------------
+
+  if (veryLittleMotionDetected()) {
+
+    if (!noMotionStarted) {
+
+      noMotionStarted = true;
+
+      noMotionStartTime = millis();
+
+      Serial.println();
+      Serial.println("Very little motion detected.");
+      Serial.println("Checking whether helmet remains motionless...");
+    }
+
+
+    // Helmet remained motionless long enough
+    if (millis() - noMotionStartTime >= NO_MOTION_REQUIRED) {
+
+      Serial.println();
+      Serial.println("====================================");
+      Serial.println("       CRASH CONFIRMED");
+      Serial.println("====================================");
+
+      Serial.println("Reason:");
+      Serial.println("High impact followed by sudden lack of motion.");
+
+      crashConfirmedTime = millis();
+
+      state = CRASH_CONFIRMED;
+
+      return;
+    }
+
+  }
+
+  else {
+
+    // -------------------------------------------------
+    // Motion continued after impact
+    // -------------------------------------------------
+
+    if (noMotionStarted) {
+
+      Serial.println("Motion detected again -> confirmation reset.");
+
+    }
+
+    noMotionStarted = false;
+
+  }
+
+
+  // ---------------------------------------------------
+  // Confirmation window expired
+  // ---------------------------------------------------
+
+  if (elapsedTime >= CONFIRMATION_WINDOW) {
+
+    Serial.println();
+    Serial.println("Impact NOT confirmed as crash.");
+    Serial.println("Motion continued after impact.");
+
+    Serial.println("Possible:");
+    Serial.println("- Aggressive braking");
+    Serial.println("- Speed breaker");
+    Serial.println("- Pothole");
+    Serial.println("- Normal disturbance");
+
+    Serial.println();
+
+    state = NORMAL;
+  }
+}
+
+
+// =====================================================
+// CRASH CONFIRMED
+// =====================================================
+
+void handleCrashConfirmed() {
+
+  unsigned long elapsed =
+    millis() - crashConfirmedTime;
+
+
+  // ---------------------------------------------------
+  // CHECK CANCEL BUTTON
+  // ---------------------------------------------------
+
+  if (digitalRead(CANCEL_BUTTON_PIN) == LOW) {
+
+    Serial.println();
+    Serial.println("====================================");
+    Serial.println("       CRASH CANCELLED");
+    Serial.println("====================================");
+
+    Serial.println("User pressed cancel button.");
+    Serial.println("Returning to normal operation.");
+
+    state = NORMAL;
+
+    delay(1000);
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // CANCELLATION TIMER
+  // ---------------------------------------------------
+
+  unsigned long remainingTime =
+    (CANCEL_TIME - elapsed) / 1000;
+
+  Serial.print("Crash confirmed. Alert in ");
+  Serial.print(remainingTime);
+  Serial.println(" seconds.");
+
+
+
+  // ---------------------------------------------------
+  // TIMER EXPIRED
+  // ---------------------------------------------------
+
+  if (elapsed >= CANCEL_TIME) {
+
+    Serial.println();
+    Serial.println("====================================");
+    Serial.println("        EMERGENCY ALERT");
+    Serial.println("====================================");
+
+    Serial.println("Crash was not cancelled.");
+    Serial.println("Sending emergency alert...");
+
+    // -------------------------------------------------
+    // ADD GSM / BLE / MOBILE ALERT HERE
+    // -------------------------------------------------
+
+    sendEmergencyAlert();
+
+    state = ALERT_SENT;
+  }
+
+  delay(500);
+}
+
+
+// =====================================================
+// ALERT SENT
+// =====================================================
+
+void handleAlertSent() {
+
+  Serial.println("Emergency alert already sent.");
+
+  // Keep system here until reset/cancel logic
+  // is added later.
+
+  delay(1000);
+}
+
+
+// =====================================================
+// SEND EMERGENCY ALERT
+// =====================================================
+
+void sendEmergencyAlert() {
+
+  Serial.println();
+  Serial.println(">>> EMERGENCY MESSAGE <<<");
+
+  Serial.println("Possible crash detected!");
+  Serial.println("Please check the rider immediately.");
+
+  // Later:
+  //
+  // BLE -> Mobile App
+  // GSM -> Emergency contact
+  // GPS -> Location
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  readMPU();
+
+
+  // ===================================================
+  // STATE MACHINE
+  // ===================================================
+
+  switch (state) {
+
+    case NORMAL:
+
+      handleNormalState();
+
+      break;
+
+
+    case IMPACT_DETECTED:
+
+      handleImpactDetected();
+
+      break;
+
+
+    case CRASH_CONFIRMED:
+
+      handleCrashConfirmed();
+
+      break;
+
+
+    case ALERT_SENT:
+
+      handleAlertSent();
+
+      break;
+  }
+
+
+  // ---------------------------------------------------
+  // DEBUG INFORMATION
+  // ---------------------------------------------------
+
+  static unsigned long lastPrint = 0;
+
+  if (millis() - lastPrint >= 500) {
+
+    lastPrint = millis();
+
+    Serial.print("ACC: ");
+    Serial.print(accelerationMagnitude, 2);
+
+    Serial.print(" g | GYRO: ");
+    Serial.print(gyroMagnitude, 2);
+
+    Serial.print(" | STATE: ");
+
+    switch (state) {
+
+      case NORMAL:
+        Serial.println("NORMAL");
+        break;
+
+      case IMPACT_DETECTED:
+        Serial.println("VERIFYING CRASH");
+        break;
+
+      case CRASH_CONFIRMED:
+        Serial.println("CRASH CONFIRMED");
+        break;
+
+      case ALERT_SENT:
+        Serial.println("ALERT SENT");
+        break;
+    }
+  }
+
+  delay(20);
+}
